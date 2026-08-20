@@ -1,0 +1,1 @@
+print("VALORANT Auto Clip")
