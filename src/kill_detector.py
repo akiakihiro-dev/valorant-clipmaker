@@ -24,9 +24,15 @@ class ROIConfig:
     環境では別途調整が必要。
     """
 
-    x_ratio: float = 0.74
+    # x_ratio・width_ratioは右端（1920x1080基準でx=1920、画面右端に一致）を
+    # 固定したまま、左に約100px分の余白を追加している。ラウンド終了時の
+    # バトルレポート画面では、敵の名前の長さ等によって自分の名前の表示位置が
+    # 通常のライブ中キルフィードより左に寄ることがあり、余白が無いと名前の
+    # 先頭文字がROIの左端で切れて名前テンプレートとの一致度が大きく下がる
+    # （0.40→0.91まで改善したことをサンプルクリップで確認済み）。
+    x_ratio: float = 0.6879
     y_ratio: float = 0.07
-    width_ratio: float = 0.26
+    width_ratio: float = 0.3121
     height_ratio: float = 0.28
 
     def to_pixels(self, frame_width: int, frame_height: int) -> Tuple[int, int, int, int]:
@@ -184,13 +190,16 @@ KILL_FEED_ROW_TOP_OFFSET_RATIO = 9.85 / 302
 # 自分のプレイヤー名「火事場のバカ」をキルフィード内で切り出したテンプレート画像。
 # サンプルクリップ（1920x1080）のキルフィード1行分から名前部分のみを切り出したもの。
 #
-# ラウンド終了時のバトルレポート/リプレイ画面では背景が赤くなり、フォントの
-# 描画も通常のライブ中キルフィード表示とわずかに異なるため一致度が下がる
-# （own_name.png単体では閾値をわずかに下回る = 検出漏れが起きる場合がある）。
-# 専用テンプレートを追加する対策も試したが、行の解像度が低く（40px高）
-# 他プレイヤーの短い名前とも紛らわしく一致してしまい、むしろ「他人のキルを
-# 自分のキルとして誤検出する」というより悪い誤検出を招いたため見送った。
-# 現状はown_name.png単体とし、バトルレポート画面での検出漏れは既知の制限とする。
+# ラウンド終了時のバトルレポート画面では、敵の名前が長い等の理由で自分の名前の
+# 表示位置が通常のライブ中キルフィードより左に寄ることがあり、ROIの左端で
+# 先頭文字が切れて一致度が下がっていた（0.40程度）。ROIConfigの左側に余白を
+# 追加したことで解消したため（0.91程度まで改善）、テンプレートはこの1種類のみで足りている。
+# なお背景色が赤くなる点は、白色文字マスクによる照合のため影響を受けない。
+#
+# 別パターン専用のテンプレートを追加する対策も試したが、行の解像度が低く
+# （40px高）他プレイヤーの短い名前とも紛らわしく一致してしまい、むしろ
+# 「他人のキルを自分のキルとして誤検出する」というより悪い誤検出を招いたため
+# 見送った（ROI拡張の方が根本原因に対する修正になっている）。
 OWN_NAME_TEMPLATE_PATHS = [
     "assets/templates/own_name.png",
 ]
@@ -226,14 +235,20 @@ def _get_own_name_template_masks() -> list[np.ndarray]:
     return _own_name_template_masks
 
 
-def _find_own_name_side(row_bgr: np.ndarray, match_threshold: float) -> str | None:
+# キル/被害の左右判定基準を、行の右端（画面右端に固定されている）からの
+# 距離で定義するための参照値。ROIConfigは左側に余白を追加して拡張されているため
+# 行の中央（row_width/2）を基準にすると、余白の分だけ本来の判定境界からずれてしまう。
+# 拡張前のROI幅（frame_width比0.26）の半分を、右端からの距離の基準として使う。
+KILL_FEED_RIGHT_HALF_WIDTH_RATIO = 0.26 / 2
+
+
+def _find_own_name_side(row_bgr: np.ndarray, match_threshold: float, frame_width: int) -> str | None:
     """行内で自分の名前テンプレートに最も一致する位置を探し、左右どちらかを返す。
 
-    行全体に対して各テンプレート（通常表示・リプレイ画面表示）でテンプレート
-    マッチングをかけ、最も一致度が高いものを採用する。一致度が
-    match_threshold未満なら該当なしとしてNoneを返す。一致した位置のx座標が
-    行の左半分にあれば"kill"（自分がキラー側）、右半分にあれば"death"
-    （自分が被害者側）とみなす。
+    行全体に対してテンプレートマッチングをかけ、最も一致度が高い位置が
+    行の右端からKILL_FEED_RIGHT_HALF_WIDTH_RATIO*frame_width以上離れていれば
+    "kill"（自分がキラー側）、それ未満なら"death"（自分が被害者側）とみなす。
+    一致度がmatch_threshold未満なら該当なしとしてNoneを返す。
     """
     row_mask = _white_text_mask(row_bgr)
 
@@ -254,7 +269,9 @@ def _find_own_name_side(row_bgr: np.ndarray, match_threshold: float) -> str | No
         return None
 
     match_center_x = best_loc[0] + best_width / 2
-    return "kill" if match_center_x < row_bgr.shape[1] / 2 else "death"
+    distance_from_right = row_bgr.shape[1] - match_center_x
+    split_distance = KILL_FEED_RIGHT_HALF_WIDTH_RATIO * frame_width
+    return "kill" if distance_from_right > split_distance else "death"
 
 
 # 行の高さ（KILL_FEED_ROW_HEIGHT_RATIOから計算）は丸め誤差で39px/40pxの間で
@@ -268,13 +285,15 @@ _NAME_MATCH_ROW_PADDING_PX = 4
 def classify_own_kill_feed_state(
     roi_frame: np.ndarray,
     match_threshold: float = 0.5,
+    width_ratio: float = ROIConfig().width_ratio,
 ) -> str | None:
     """キルフィードROI内で自分の名前がある行を探し、キラー側("kill")か
     被害者側("death")かを判定する。
 
     自分のプレイヤー名「火事場のバカ」のテンプレート画像を各行に対して
-    テンプレートマッチングし、最も一致する位置が行の左半分なら"kill"
-    （自分がキラー側）、右半分なら"death"（自分が被害者側）とみなす。
+    テンプレートマッチングし、最も一致する位置が行の右端から一定距離以上
+    離れていれば"kill"（自分がキラー側）、それ未満なら"death"
+    （自分が被害者側）とみなす（`_find_own_name_side`参照）。
 
     以前は緑（ティール）色のハイライトが乗っている側を見て判定していたが、
     リプレイモードでは自分の名前の背景色が赤になることがあるなど、色は
@@ -291,6 +310,8 @@ def classify_own_kill_feed_state(
     いずれかの行が "kill" ならそれを優先して返す。
     """
     height = roi_frame.shape[0]
+    width = roi_frame.shape[1]
+    frame_width = width / width_ratio
     row_height = height * KILL_FEED_ROW_HEIGHT_RATIO
     top_offset = height * KILL_FEED_ROW_TOP_OFFSET_RATIO
     num_rows = int((height - top_offset) / row_height)
@@ -300,7 +321,7 @@ def classify_own_kill_feed_state(
         row_top = max(0, int(top_offset + i * row_height) - _NAME_MATCH_ROW_PADDING_PX)
         row_bottom = min(height, int(top_offset + (i + 1) * row_height) + _NAME_MATCH_ROW_PADDING_PX)
         row = roi_frame[row_top:row_bottom, :]
-        state = _find_own_name_side(row, match_threshold)
+        state = _find_own_name_side(row, match_threshold, frame_width)
         if state:
             row_states.append(state)
 
@@ -329,7 +350,7 @@ def detect_own_kill_windows(
     prev_timestamp = None
 
     for timestamp, roi_frame in extract_roi_frames(video_path, roi, sample_fps):
-        is_own_kill_visible = classify_own_kill_feed_state(roi_frame) == "kill"
+        is_own_kill_visible = classify_own_kill_feed_state(roi_frame, width_ratio=roi.width_ratio) == "kill"
 
         if is_own_kill_visible and window_start is None:
             window_start = timestamp
