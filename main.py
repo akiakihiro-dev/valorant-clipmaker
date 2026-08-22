@@ -1,13 +1,14 @@
 """キルフィードで自分のキルが表示されている区間を抜き出すPoCスクリプト。
 
 `clipsample/`内の動画に対し、キルフィード内の緑色ハイライト（自分のキル）が
-左側に表示されている区間を検出し、区間ごとに動画を切り出して`output/`へ保存する。
+左側に表示されている区間を検出し、それらを1本に結合したハイライトクリップとして
+`output/`へ保存する。
 """
 
 import glob
 import os
 
-from src.clipper import extract_clips
+from src.clipper import create_highlight_clip
 from src.highlight_detector import compute_highlight_ranges, get_video_duration_sec
 from src.kill_detector import detect_own_kill_windows
 
@@ -36,9 +37,9 @@ def main() -> None:
         for start, end in highlight_ranges:
             print(f"  {start:.2f}s - {end:.2f}s (duration {end - start:.2f}s)")
 
-        clip_output_dir = os.path.join(OUTPUT_DIR, video_name)
-        output_paths = extract_clips(video_path, highlight_ranges, clip_output_dir, prefix="own_kill")
-        print(f"[{video_name}] {len(output_paths)}件のクリップを{clip_output_dir}に出力しました。")
+        output_path = os.path.join(OUTPUT_DIR, f"{video_name}_highlight.mp4")
+        create_highlight_clip(video_path, highlight_ranges, output_path)
+        print(f"[{video_name}] {output_path}に出力しました。")
 
 
 if __name__ == "__main__":

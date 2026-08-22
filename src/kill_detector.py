@@ -170,19 +170,6 @@ def detect_kill_windows(
     return [w for w in merged_windows if (w[1] - w[0]) >= min_duration_sec]
 
 
-def _teal_ratio(
-    hsv_region: np.ndarray, hue_low: int, hue_high: int, saturation_threshold: int
-) -> float:
-    """HSV領域内で、緑（ティール）色相のピクセルが彩度のあるピクセルに占める比率を返す。"""
-    hue = hsv_region[:, :, 0].astype(np.int32)
-    saturation = hsv_region[:, :, 1].astype(np.int32)
-    colored = saturation > saturation_threshold
-    if colored.sum() == 0:
-        return 0.0
-    teal_mask = (hue >= hue_low) & (hue <= hue_high) & colored
-    return float(teal_mask.sum()) / colored.sum()
-
-
 # キルフィードの1行あたりの高さ・先頭オフセット（ROI全体に対する比率）。
 # クロスヘアアイコン（彩度が低く明度が高い白色部分）のY座標をサンプルクリップの
 # 複数フレームで実測して求めた値。ROIConfig()のデフォルト値（1920x1080基準）では
@@ -194,41 +181,21 @@ KILL_FEED_ROW_HEIGHT_RATIO = 39.3 / 302
 KILL_FEED_ROW_TOP_OFFSET_RATIO = 9.85 / 302
 
 
-def _classify_row(
-    row_bgr: np.ndarray, hue_low: int, hue_high: int, saturation_threshold: int, ratio_threshold: float
-) -> str | None:
-    """1行分の画像から、自分がキラー側("kill")か被害者側("death")かを判定する（色ハイライトのみ）。
-
-    左右の判定領域は行の中央（クロスヘアアイコン）から離した位置を見る。
-    ハイライトの緑〜黄色のグラデーションは中央のクロスヘアアイコンの少し先まで
-    続いており、中央に近い位置（45%〜55%付近）まで判定領域を広げると、
-    どちらの色でもない側にもグラデーションの残りが入り込み、僅差で
-    kill/deathの判定がフレームごとに反転してしまう（キルフィードが表示され
-    続けているのに区間が不自然に分割される原因になっていた）。
-
-    マップ内の緑色の背景（植物・ガラス張りの建物等）がこの判定域に写り込むと、
-    実際のキルフィードより強い緑色反応を示すことがあり、色情報だけでは
-    誤検出を避けられない。そのため`_classify_row_by_name`で名前の
-    テンプレートマッチングと組み合わせて使う想定。
-    """
-    hsv = cv2.cvtColor(row_bgr, cv2.COLOR_BGR2HSV)
-    height, width = row_bgr.shape[:2]
-    left = hsv[:, int(width * 0.15) : int(width * 0.35)]
-    right = hsv[:, int(width * 0.70) : int(width * 0.90)]
-
-    left_ratio = _teal_ratio(left, hue_low, hue_high, saturation_threshold)
-    right_ratio = _teal_ratio(right, hue_low, hue_high, saturation_threshold)
-
-    if max(left_ratio, right_ratio) < ratio_threshold:
-        return None
-    return "kill" if left_ratio > right_ratio else "death"
-
-
 # 自分のプレイヤー名「火事場のバカ」をキルフィード内で切り出したテンプレート画像。
 # サンプルクリップ（1920x1080）のキルフィード1行分から名前部分のみを切り出したもの。
-OWN_NAME_TEMPLATE_PATH = "assets/templates/own_name.png"
+#
+# ラウンド終了時のバトルレポート/リプレイ画面では背景が赤くなり、フォントの
+# 描画も通常のライブ中キルフィード表示とわずかに異なるため一致度が下がる
+# （own_name.png単体では閾値をわずかに下回る = 検出漏れが起きる場合がある）。
+# 専用テンプレートを追加する対策も試したが、行の解像度が低く（40px高）
+# 他プレイヤーの短い名前とも紛らわしく一致してしまい、むしろ「他人のキルを
+# 自分のキルとして誤検出する」というより悪い誤検出を招いたため見送った。
+# 現状はown_name.png単体とし、バトルレポート画面での検出漏れは既知の制限とする。
+OWN_NAME_TEMPLATE_PATHS = [
+    "assets/templates/own_name.png",
+]
 
-_own_name_template_mask: np.ndarray | None = None
+_own_name_template_masks: list[np.ndarray] | None = None
 
 
 def _white_text_mask(bgr: np.ndarray) -> np.ndarray:
@@ -245,36 +212,48 @@ def _white_text_mask(bgr: np.ndarray) -> np.ndarray:
     return (mask.astype(np.uint8)) * 255
 
 
-def _get_own_name_template_mask() -> np.ndarray:
-    """自分の名前テンプレートの二値マスクを読み込む（初回のみ）。"""
-    global _own_name_template_mask
-    if _own_name_template_mask is None:
-        template_bgr = cv2.imread(OWN_NAME_TEMPLATE_PATH)
-        if template_bgr is None:
-            raise IOError(f"名前テンプレート画像を読み込めませんでした: {OWN_NAME_TEMPLATE_PATH}")
-        _own_name_template_mask = _white_text_mask(template_bgr)
-    return _own_name_template_mask
+def _get_own_name_template_masks() -> list[np.ndarray]:
+    """自分の名前テンプレート（複数パターン）の二値マスクを読み込む（初回のみ）。"""
+    global _own_name_template_masks
+    if _own_name_template_masks is None:
+        masks = []
+        for path in OWN_NAME_TEMPLATE_PATHS:
+            template_bgr = cv2.imread(path)
+            if template_bgr is None:
+                raise IOError(f"名前テンプレート画像を読み込めませんでした: {path}")
+            masks.append(_white_text_mask(template_bgr))
+        _own_name_template_masks = masks
+    return _own_name_template_masks
 
 
 def _find_own_name_side(row_bgr: np.ndarray, match_threshold: float) -> str | None:
     """行内で自分の名前テンプレートに最も一致する位置を探し、左右どちらかを返す。
 
-    行全体に対してテンプレートマッチングをかけ、最も一致度が高い位置のx座標が
+    行全体に対して各テンプレート（通常表示・リプレイ画面表示）でテンプレート
+    マッチングをかけ、最も一致度が高いものを採用する。一致度が
+    match_threshold未満なら該当なしとしてNoneを返す。一致した位置のx座標が
     行の左半分にあれば"kill"（自分がキラー側）、右半分にあれば"death"
-    （自分が被害者側）とみなす。一致度がmatch_threshold未満なら該当なしとしてNoneを返す。
+    （自分が被害者側）とみなす。
     """
-    template_mask = _get_own_name_template_mask()
     row_mask = _white_text_mask(row_bgr)
 
-    if row_mask.shape[0] < template_mask.shape[0] or row_mask.shape[1] < template_mask.shape[1]:
+    best_val = -1.0
+    best_loc = None
+    best_width = 0
+    for template_mask in _get_own_name_template_masks():
+        if row_mask.shape[0] < template_mask.shape[0] or row_mask.shape[1] < template_mask.shape[1]:
+            continue
+        result = cv2.matchTemplate(row_mask, template_mask, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        if max_val > best_val:
+            best_val = max_val
+            best_loc = max_loc
+            best_width = template_mask.shape[1]
+
+    if best_loc is None or best_val < match_threshold:
         return None
 
-    result = cv2.matchTemplate(row_mask, template_mask, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, max_loc = cv2.minMaxLoc(result)
-    if max_val < match_threshold:
-        return None
-
-    match_center_x = max_loc[0] + template_mask.shape[1] / 2
+    match_center_x = best_loc[0] + best_width / 2
     return "kill" if match_center_x < row_bgr.shape[1] / 2 else "death"
 
 
@@ -286,71 +265,27 @@ def _find_own_name_side(row_bgr: np.ndarray, match_threshold: float) -> str | No
 _NAME_MATCH_ROW_PADDING_PX = 4
 
 
-def _classify_row_by_name(
-    roi_frame: np.ndarray,
-    row_top: int,
-    row_bottom: int,
-    match_threshold: float,
-    hue_low: int,
-    hue_high: int,
-    saturation_threshold: int,
-    ratio_threshold: float,
-) -> str | None:
-    """まず色ハイライトで候補側を絞り込み、見つかった場合のみ名前の一致を確認する。
-
-    色ハイライトだけでは、マップ内の緑色の背景（植物・ガラス張りの建物等）が
-    実際のキルフィードより強い反応を示すことがあり、誤検出の原因になっていた。
-    一方、名前のテンプレートマッチングだけを独立に行ごとに走らせると、行の
-    高さの丸め誤差でテンプレートが収まらない行が生じ、実際にキルフィードが
-    表示されているのに検出が抜け落ちることがあった。
-    そのため、まず色ハイライト（行の厳密な境界で判定、既存ロジックのまま）で
-    候補側を絞り込み、候補が見つかった行だけ上下に余白を持たせて切り出し、
-    名前テンプレートと照合して確認する。
-    """
-    row = roi_frame[row_top:row_bottom, :]
-    color_side = _classify_row(row, hue_low, hue_high, saturation_threshold, ratio_threshold)
-    if color_side is None:
-        return None
-
-    padded_top = max(0, row_top - _NAME_MATCH_ROW_PADDING_PX)
-    padded_bottom = min(roi_frame.shape[0], row_bottom + _NAME_MATCH_ROW_PADDING_PX)
-    padded_row = roi_frame[padded_top:padded_bottom, :]
-
-    name_side = _find_own_name_side(padded_row, match_threshold)
-    if name_side != color_side:
-        return None
-
-    return color_side
-
-
 def classify_own_kill_feed_state(
     roi_frame: np.ndarray,
     match_threshold: float = 0.5,
-    hue_low: int = 50,
-    hue_high: int = 82,
-    saturation_threshold: int = 40,
-    ratio_threshold: float = 0.15,
 ) -> str | None:
-    """キルフィードROI内で自分が関わる行があるか、あるなら自分がキラー側か被害者側かを判定する。
+    """キルフィードROI内で自分の名前がある行を探し、キラー側("kill")か
+    被害者側("death")かを判定する。
 
-    Valorantのキルフィードは、自分が関わった行を緑（ティール、Hue≈70-75）で
-    ハイライトする。このハイライトは行全体ではなく、行内で自分の名前がある側
-    （左＝自分がキラー、右＝自分が被害者）に強く寄ることをサンプルクリップで確認した。
+    自分のプレイヤー名「火事場のバカ」のテンプレート画像を各行に対して
+    テンプレートマッチングし、最も一致する位置が行の左半分なら"kill"
+    （自分がキラー側）、右半分なら"death"（自分が被害者側）とみなす。
 
-    色ハイライトだけでは、マップ内の緑色の背景（植物・ガラス張りの建物等）を
-    誤検出することがあるため、自分のプレイヤー名「火事場のバカ」のテンプレート
-    マッチングと組み合わせ、両方が一致した場合のみ検出とする
-    （`_classify_row_by_name`参照）。
+    以前は緑（ティール）色のハイライトが乗っている側を見て判定していたが、
+    リプレイモードでは自分の名前の背景色が赤になることがあるなど、色は
+    状況によって変わりうるため、色に依存しない名前の形そのものの一致で判定する。
 
-    hue_highの上限は95ではなく82に絞っている。KAY/Oなど一部エージェントの
-    アイコン自体がシアン系の見た目（Hue≈80-90）を持ち、95まで許容すると
-    キャラクター側の色を誤ってハイライトと誤認し、本来「kill」と判定すべき
-    行が「death」側に誤判定されてキル区間の検出が途切れる問題があったため。
+    行の高さは丸め誤差で39px/40pxの間でばらつくため、テンプレート（40px）が
+    収まらない行が出ないよう、判定対象の行は上下に余白を持たせて切り出す。
 
     キルフィードは新しい行が常に固定の高さで上から順に埋まっていく（試合序盤で
-    行数が少なくても1行の高さは変わらない）ため、ROI全体をまとめて見ると
-    埋まっていない/無関係な行の分だけ比率が薄まってしまう。そのため固定の行高さで
-    分割し、行ごとに判定してから統合する。
+    行数が少なくても1行の高さは変わらない）ため、固定の行高さで分割し、
+    行ごとに判定してから統合する。
 
     戻り値は "kill"（自分のキル）、"death"（自分の被害）、どちらの気配もなければ None。
     いずれかの行が "kill" ならそれを優先して返す。
@@ -362,11 +297,10 @@ def classify_own_kill_feed_state(
 
     row_states = []
     for i in range(num_rows):
-        row_top = int(top_offset + i * row_height)
-        row_bottom = int(top_offset + (i + 1) * row_height)
-        state = _classify_row_by_name(
-            roi_frame, row_top, row_bottom, match_threshold, hue_low, hue_high, saturation_threshold, ratio_threshold
-        )
+        row_top = max(0, int(top_offset + i * row_height) - _NAME_MATCH_ROW_PADDING_PX)
+        row_bottom = min(height, int(top_offset + (i + 1) * row_height) + _NAME_MATCH_ROW_PADDING_PX)
+        row = roi_frame[row_top:row_bottom, :]
+        state = _find_own_name_side(row, match_threshold)
         if state:
             row_states.append(state)
 
