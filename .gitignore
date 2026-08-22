@@ -1,6 +1,10 @@
-# サンプル録画・検証用一時画像（サイズが大きい、または使い捨てのため）
+# サンプル録画・検証用一時画像・生成物（サイズが大きい、または使い捨てのため）
 clipsample/
 scratch_frames/
+output/
+
+# Claude Code内部管理用（worktree等のツール作業データ）
+.claude/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

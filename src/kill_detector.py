@@ -183,19 +183,33 @@ def _teal_ratio(
     return float(teal_mask.sum()) / colored.sum()
 
 
-# キルフィードの1行あたりの高さ（ROI全体に対する比率）。新しいキルは既存の行を
-# 押し下げず、常に固定の高さで上から順に埋まっていくため、表示行数に関わらず一定。
-KILL_FEED_ROW_HEIGHT_RATIO = 1 / 6
+# キルフィードの1行あたりの高さ・先頭オフセット（ROI全体に対する比率）。
+# クロスヘアアイコン（彩度が低く明度が高い白色部分）のY座標をサンプルクリップの
+# 複数フレームで実測して求めた値。ROIConfig()のデフォルト値（1920x1080基準）では
+# 実際の1行のピッチはROI高さの約1/6ではなく約1/7.7で、先頭行の手前にも
+# 高さの約3%分のマージンがある。以前は1/6・オフセット無しで割っていたため、
+# row_idxが大きくなるほど実際の行境界とのズレが蓄積し、3行目以降で隣接行の
+# 内容が混ざってキル/被害の判定が不安定になる問題があった。
+KILL_FEED_ROW_HEIGHT_RATIO = 39.3 / 302
+KILL_FEED_ROW_TOP_OFFSET_RATIO = 9.85 / 302
 
 
 def _classify_row(
     row_bgr: np.ndarray, hue_low: int, hue_high: int, saturation_threshold: int, ratio_threshold: float
 ) -> str | None:
-    """1行分の画像から、自分がキラー側("kill")か被害者側("death")かを判定する。"""
+    """1行分の画像から、自分がキラー側("kill")か被害者側("death")かを判定する。
+
+    左右の判定領域は行の中央（クロスヘアアイコン）から離した位置を見る。
+    ハイライトの緑〜黄色のグラデーションは中央のクロスヘアアイコンの少し先まで
+    続いており、中央に近い位置（45%〜55%付近）まで判定領域を広げると、
+    どちらの色でもない側にもグラデーションの残りが入り込み、僅差で
+    kill/deathの判定がフレームごとに反転してしまう（キルフィードが表示され
+    続けているのに区間が不自然に分割される原因になっていた）。
+    """
     hsv = cv2.cvtColor(row_bgr, cv2.COLOR_BGR2HSV)
     height, width = row_bgr.shape[:2]
-    left = hsv[:, int(width * 0.15) : int(width * 0.45)]
-    right = hsv[:, int(width * 0.55) : int(width * 0.85)]
+    left = hsv[:, int(width * 0.15) : int(width * 0.35)]
+    right = hsv[:, int(width * 0.70) : int(width * 0.90)]
 
     left_ratio = _teal_ratio(left, hue_low, hue_high, saturation_threshold)
     right_ratio = _teal_ratio(right, hue_low, hue_high, saturation_threshold)
@@ -208,7 +222,7 @@ def _classify_row(
 def classify_own_kill_feed_state(
     roi_frame: np.ndarray,
     hue_low: int = 50,
-    hue_high: int = 95,
+    hue_high: int = 82,
     saturation_threshold: int = 40,
     ratio_threshold: float = 0.15,
 ) -> str | None:
@@ -217,6 +231,11 @@ def classify_own_kill_feed_state(
     Valorantのキルフィードは、自分が関わった行を緑（ティール、Hue≈70-75）で
     ハイライトする。このハイライトは行全体ではなく、行内で自分の名前がある側
     （左＝自分がキラー、右＝自分が被害者）に強く寄ることをサンプルクリップで確認した。
+
+    hue_highの上限は95ではなく82に絞っている。KAY/Oなど一部エージェントの
+    アイコン自体がシアン系の見た目（Hue≈80-90）を持ち、95まで許容すると
+    キャラクター側の色を誤ってハイライトと誤認し、本来「kill」と判定すべき
+    行が「death」側に誤判定されてキル区間の検出が途切れる問題があったため。
 
     キルフィードは新しい行が常に固定の高さで上から順に埋まっていく（試合序盤で
     行数が少なくても1行の高さは変わらない）ため、ROI全体をまとめて見ると
@@ -228,11 +247,14 @@ def classify_own_kill_feed_state(
     """
     height = roi_frame.shape[0]
     row_height = height * KILL_FEED_ROW_HEIGHT_RATIO
-    num_rows = int(height / row_height)
+    top_offset = height * KILL_FEED_ROW_TOP_OFFSET_RATIO
+    num_rows = int((height - top_offset) / row_height)
 
     row_states = []
     for i in range(num_rows):
-        row = roi_frame[int(i * row_height) : int((i + 1) * row_height), :]
+        row_top = int(top_offset + i * row_height)
+        row_bottom = int(top_offset + (i + 1) * row_height)
+        row = roi_frame[row_top:row_bottom, :]
         state = _classify_row(row, hue_low, hue_high, saturation_threshold, ratio_threshold)
         if state:
             row_states.append(state)
