@@ -168,3 +168,118 @@ def detect_kill_windows(
             merged_windows.append((start, end))
 
     return [w for w in merged_windows if (w[1] - w[0]) >= min_duration_sec]
+
+
+def _teal_ratio(
+    hsv_region: np.ndarray, hue_low: int, hue_high: int, saturation_threshold: int
+) -> float:
+    """HSV領域内で、緑（ティール）色相のピクセルが彩度のあるピクセルに占める比率を返す。"""
+    hue = hsv_region[:, :, 0].astype(np.int32)
+    saturation = hsv_region[:, :, 1].astype(np.int32)
+    colored = saturation > saturation_threshold
+    if colored.sum() == 0:
+        return 0.0
+    teal_mask = (hue >= hue_low) & (hue <= hue_high) & colored
+    return float(teal_mask.sum()) / colored.sum()
+
+
+# キルフィードの1行あたりの高さ（ROI全体に対する比率）。新しいキルは既存の行を
+# 押し下げず、常に固定の高さで上から順に埋まっていくため、表示行数に関わらず一定。
+KILL_FEED_ROW_HEIGHT_RATIO = 1 / 6
+
+
+def _classify_row(
+    row_bgr: np.ndarray, hue_low: int, hue_high: int, saturation_threshold: int, ratio_threshold: float
+) -> str | None:
+    """1行分の画像から、自分がキラー側("kill")か被害者側("death")かを判定する。"""
+    hsv = cv2.cvtColor(row_bgr, cv2.COLOR_BGR2HSV)
+    height, width = row_bgr.shape[:2]
+    left = hsv[:, int(width * 0.15) : int(width * 0.45)]
+    right = hsv[:, int(width * 0.55) : int(width * 0.85)]
+
+    left_ratio = _teal_ratio(left, hue_low, hue_high, saturation_threshold)
+    right_ratio = _teal_ratio(right, hue_low, hue_high, saturation_threshold)
+
+    if max(left_ratio, right_ratio) < ratio_threshold:
+        return None
+    return "kill" if left_ratio > right_ratio else "death"
+
+
+def classify_own_kill_feed_state(
+    roi_frame: np.ndarray,
+    hue_low: int = 50,
+    hue_high: int = 95,
+    saturation_threshold: int = 40,
+    ratio_threshold: float = 0.15,
+) -> str | None:
+    """キルフィードROI内で自分が関わる行があるか、あるなら自分がキラー側か被害者側かを判定する。
+
+    Valorantのキルフィードは、自分が関わった行を緑（ティール、Hue≈70-75）で
+    ハイライトする。このハイライトは行全体ではなく、行内で自分の名前がある側
+    （左＝自分がキラー、右＝自分が被害者）に強く寄ることをサンプルクリップで確認した。
+
+    キルフィードは新しい行が常に固定の高さで上から順に埋まっていく（試合序盤で
+    行数が少なくても1行の高さは変わらない）ため、ROI全体をまとめて見ると
+    埋まっていない/無関係な行の分だけ比率が薄まってしまう。そのため固定の行高さで
+    分割し、行ごとに判定してから統合する。プレイヤー名のOCRは不要。
+
+    戻り値は "kill"（自分のキル）、"death"（自分の被害）、どちらの気配もなければ None。
+    いずれかの行が "kill" ならそれを優先して返す。
+    """
+    height = roi_frame.shape[0]
+    row_height = height * KILL_FEED_ROW_HEIGHT_RATIO
+    num_rows = int(height / row_height)
+
+    row_states = []
+    for i in range(num_rows):
+        row = roi_frame[int(i * row_height) : int((i + 1) * row_height), :]
+        state = _classify_row(row, hue_low, hue_high, saturation_threshold, ratio_threshold)
+        if state:
+            row_states.append(state)
+
+    if "kill" in row_states:
+        return "kill"
+    if "death" in row_states:
+        return "death"
+    return None
+
+
+def detect_own_kill_windows(
+    video_path: str,
+    roi: ROIConfig = ROIConfig(),
+    sample_fps: float = 10.0,
+    min_duration_sec: float = 0.3,
+    merge_gap_sec: float = 0.5,
+) -> List[Tuple[float, float]]:
+    """キルフィード内に「自分のキル」を示す緑色の行が出現している区間を検出する。
+
+    行の出現から一定時間はキルフィードに残り続けるため、連続キル（マルチキル）の
+    場合はまとめて1つの区間として返る。`detect_kill_windows`（キルマーク方式）と
+    同様に、短いギャップの結合・最小持続時間未満のノイズ除去を行う。
+    """
+    raw_windows: List[Tuple[float, float]] = []
+    window_start = None
+    prev_timestamp = None
+
+    for timestamp, roi_frame in extract_roi_frames(video_path, roi, sample_fps):
+        is_own_kill_visible = classify_own_kill_feed_state(roi_frame) == "kill"
+
+        if is_own_kill_visible and window_start is None:
+            window_start = timestamp
+        elif not is_own_kill_visible and window_start is not None:
+            raw_windows.append((window_start, prev_timestamp))
+            window_start = None
+
+        prev_timestamp = timestamp
+
+    if window_start is not None:
+        raw_windows.append((window_start, prev_timestamp))
+
+    merged_windows: List[Tuple[float, float]] = []
+    for start, end in raw_windows:
+        if merged_windows and start - merged_windows[-1][1] <= merge_gap_sec:
+            merged_windows[-1] = (merged_windows[-1][0], end)
+        else:
+            merged_windows.append((start, end))
+
+    return [w for w in merged_windows if (w[1] - w[0]) >= min_duration_sec]
