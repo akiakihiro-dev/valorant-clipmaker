@@ -1,8 +1,14 @@
 """検出区間から動画クリップを切り出すモジュール。
 
 `ffmpeg`コマンドを外部プロセスとして呼び出し、区間の切り出し・結合を行う。
-再エンコードなし（`-c copy`）はコピーのみのため高速・無劣化だが、キーフレームの
-位置によっては失敗する場合があるため、失敗時は再エンコードにフォールバックする。
+
+区間の切り出しは再エンコード（`-c:v libx264 -c:a aac`）で行う。`-c copy`は
+高速・無劣化だが、映像はキーフレームの位置でしか開始できないのに対し音声は
+任意の位置から開始できるため、指定した開始時刻と映像のキーフレーム位置が
+ずれるほど音声と映像の開始タイミングがずれてしまい（`-ss`を`-i`の前に置けば
+音声が映像より早く始まり、後に置けば映像が音声より遅れて始まる）、
+どちらの置き方でも解消できなかった。再エンコードであれば任意の時刻を
+基準に音声・映像を揃えて出力できるため、この問題が起きない。
 """
 
 import os
@@ -12,54 +18,34 @@ import tempfile
 from typing import List, Tuple
 
 
-def _run_ffmpeg_cut(
-    video_path: str, start: float, duration: float, output_path: str, copy: bool
-) -> bool:
-    """ffmpegで1区間を切り出す。成功した場合はTrueを返す。"""
+def _cut_segment(video_path: str, start: float, end: float, output_path: str) -> None:
+    """入力動画から区間を切り出す（再エンコード）。"""
+    duration = end - start
     command = [
         "ffmpeg",
         "-y",
         "-i",
         video_path,
-        # -ssを-iより前に置く高速シークだと、-c copyでは直前のキーフレームまで
-        # 遡って開始するため、複数区間を結合したときに前の区間の末尾と同じ
-        # 内容が重複再生されることがあった。-iの後に置く正確シークでは
-        # 指定時刻以降の最初のキーフレームから開始する（遡らない）ため、
-        # 区間同士が重複しない。
         "-ss",
         f"{start:.3f}",
         "-t",
         f"{duration:.3f}",
-        # 音声側が映像のキーフレーム位置より手前のフレームからコピーされ、
-        # 音声PTSが負の値になることがある。これを補正しないと再生開始直後に
-        # 音声・映像がズレてカクつくため、タイムスタンプを0基準に揃える。
-        "-avoid_negative_ts",
-        "make_zero",
+        "-c:v",
+        "libx264",
+        "-c:a",
+        "aac",
+        output_path,
     ]
-    if copy:
-        command += ["-c", "copy"]
-    else:
-        command += ["-c:v", "libx264", "-c:a", "aac"]
-    command.append(output_path)
-
     result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    if result.returncode != 0:
-        return False
-    return os.path.exists(output_path) and os.path.getsize(output_path) > 0
-
-
-def _cut_segment(video_path: str, start: float, end: float, output_path: str) -> None:
-    """入力動画から区間を切り出す。`-c copy`に失敗した場合のみ再エンコードする。"""
-    duration = end - start
-    if _run_ffmpeg_cut(video_path, start, duration, output_path, copy=True):
-        return
-
-    if not _run_ffmpeg_cut(video_path, start, duration, output_path, copy=False):
-        raise RuntimeError(f"ffmpegでの切り出しに失敗しました ({start:.2f}s - {end:.2f}s)")
+    if result.returncode != 0 or not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+        raise RuntimeError(
+            f"ffmpegでの切り出しに失敗しました ({start:.2f}s - {end:.2f}s): "
+            f"{result.stderr.decode(errors='ignore')}"
+        )
 
 
 def _concat_segments(segment_paths: List[str], output_path: str) -> None:
-    """複数の動画ファイルをffmpegのconcat demuxerで1本に結合する。"""
+    """複数の動画ファイルをffmpegのconcat demuxerで1本に結合する（再エンコード）。"""
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".txt", delete=False, encoding="utf-8"
     ) as list_file:
@@ -78,8 +64,10 @@ def _concat_segments(segment_paths: List[str], output_path: str) -> None:
             "0",
             "-i",
             list_file_path,
-            "-c",
-            "copy",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
             output_path,
         ]
         result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
