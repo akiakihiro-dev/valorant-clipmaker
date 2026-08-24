@@ -3,6 +3,9 @@ clipsample/
 scratch_frames/
 output/
 
+# 自分のプレイヤー名テンプレート画像（個人が特定可能な情報のため各自ローカルに用意する）
+assets/templates/own_name.png
+
 # Claude Code内部管理用（worktree等のツール作業データ）
 .claude/
 
