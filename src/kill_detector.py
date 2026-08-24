@@ -1,9 +1,7 @@
 """動画からのフレーム抽出とキル検出を行うモジュール。
 
-キル検出は、画面中央下部（クロスヘアの少し下）にキル時のみ出現する「キルマーク」
-演出を対象とする。キルマークの絵柄はプレイヤーのクロスヘア設定やキルの種類によって
-複数パターンが存在するため、特定の絵柄へのテンプレートマッチングではなく、
-彩度・明度に基づく「UI要素らしさ」の変化を検出する形状非依存の方式を採る。
+キル検出は、キルフィード内で自分のプレイヤー名がキラー側（行の右寄り）に
+表示されているかどうかをテンプレートマッチングで判定する方式を採る。
 """
 
 from dataclasses import dataclass
@@ -93,92 +91,6 @@ def extract_roi_frames(
     """
     for timestamp_sec, frame in extract_frames(video_path, sample_fps):
         yield timestamp_sec, crop_roi(frame, roi)
-
-
-# --- キルマーク方式（代替アプローチ、現在のmain.pyのパイプラインでは未使用） ---
-#
-# 以下の`detect_kill_windows`は、自分のプレイヤー名テンプレートに頼らず
-# キルマーク演出の出現自体を検出する方式。名前テンプレートの用意が不要な
-# 利点がある一方、味方のキルとの区別ができないため、現在のパイプラインでは
-# `detect_own_kill_windows`（名前テンプレートマッチング方式）を採用している。
-
-# 画面中央下部、クロスヘアの少し下に出現するキルマークのROI。
-# `clipsample/` のサンプルクリップ（1920x1080）を目視確認して設定したもので、
-# キルマークが展開しきった状態（周囲の円形装飾込み）を余裕を持ってカバーする範囲。
-KILL_MARK_ROI = ROIConfig(
-    x_ratio=0.458,
-    y_ratio=0.72,
-    width_ratio=0.09,
-    height_ratio=0.093,
-)
-
-
-def compute_kill_mark_score(roi_frame: np.ndarray) -> float:
-    """ROI画像に対して「UI要素らしさ」のスコア（0.0〜1.0）を計算する。
-
-    キルマークは彩度・明度が高い暖色（赤・金色等）、または低彩度高明度の白色で
-    描かれており、壁や床などの背景テクスチャはこの条件に当てはまりにくい。
-    この性質を利用し、キルマークの絵柄そのものに依存せずに出現を検出する。
-
-    マップ内の緑・青系オブジェクト（設置物やアビリティエフェクト等）は彩度・明度が
-    高くても誤検出の原因になるため、色相（Hue）を赤〜金・白系に限定して除外する。
-    """
-    hsv = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2HSV)
-    hue = hsv[:, :, 0].astype(np.int32)
-    saturation = hsv[:, :, 1].astype(np.int32)
-    value = hsv[:, :, 2].astype(np.int32)
-
-    is_warm_hue = (hue <= 35) | (hue >= 160)
-    colorful_mask = (saturation > 120) & (value > 120) & is_warm_hue
-    white_mask = (saturation < 60) & (value > 200)
-    mask = colorful_mask | white_mask
-    return float(mask.sum()) / mask.size
-
-
-def detect_kill_windows(
-    video_path: str,
-    roi: ROIConfig = KILL_MARK_ROI,
-    sample_fps: float = 10.0,
-    threshold: float = 0.015,
-    min_duration_sec: float = 0.3,
-    merge_gap_sec: float = 0.5,
-) -> List[Tuple[float, float]]:
-    """キルマークが出現している区間（開始・終了時刻）を検出する。
-
-    連続キル（マルチキル）の場合はキルマークが表示され続けるため、
-    まとめて1つの区間として返る。区間の開始時刻をキル発生時刻の目安として扱う想定。
-
-    マルチキル展開アニメーションの途中でスコアが一瞬閾値を割る、あるいは環境オブジェクト
-    による単発ノイズが挟まることがあるため、`merge_gap_sec` 以下の間隔は同一区間として
-    結合し、`min_duration_sec` 未満しか続かない区間はノイズとして除外する。
-    """
-    raw_windows: List[Tuple[float, float]] = []
-    window_start = None
-    prev_timestamp = None
-
-    for timestamp, roi_frame in extract_roi_frames(video_path, roi, sample_fps):
-        score = compute_kill_mark_score(roi_frame)
-        is_mark_visible = score > threshold
-
-        if is_mark_visible and window_start is None:
-            window_start = timestamp
-        elif not is_mark_visible and window_start is not None:
-            raw_windows.append((window_start, prev_timestamp))
-            window_start = None
-
-        prev_timestamp = timestamp
-
-    if window_start is not None:
-        raw_windows.append((window_start, prev_timestamp))
-
-    merged_windows: List[Tuple[float, float]] = []
-    for start, end in raw_windows:
-        if merged_windows and start - merged_windows[-1][1] <= merge_gap_sec:
-            merged_windows[-1] = (merged_windows[-1][0], end)
-        else:
-            merged_windows.append((start, end))
-
-    return [w for w in merged_windows if (w[1] - w[0]) >= min_duration_sec]
 
 
 # キルフィードの1行あたりの高さ・先頭オフセット（ROI全体に対する比率）。
@@ -333,8 +245,8 @@ def detect_own_kill_windows(
     """キルフィード内に「自分のキル」を示す行が出現している区間を検出する。
 
     行の出現から一定時間はキルフィードに残り続けるため、連続キル（マルチキル）の
-    場合はまとめて1つの区間として返る。`detect_kill_windows`（キルマーク方式）と
-    同様に、短いギャップの結合・最小持続時間未満のノイズ除去を行う。
+    場合はまとめて1つの区間として返る。短いギャップの結合・最小持続時間未満の
+    ノイズ除去を行う。
     """
     raw_windows: List[Tuple[float, float]] = []
     window_start = None
