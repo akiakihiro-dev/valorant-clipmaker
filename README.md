@@ -42,7 +42,8 @@ pip install -r requirements.txt
 ## 使い方
 
 1. 自分のプレイヤー名をキルフィードから切り出した画像を用意し、
-   `assets/templates/own_name.png` として配置する。
+   `assets/templates/own_name.png` として配置する（切り出しのコツは
+   [assets/templates/README.md](assets/templates/README.md)を参照）。
 2. 処理したい録画クリップ（`.mp4`）を `clipsample/` ディレクトリに置く。
 3. 実行する。
 
