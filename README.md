@@ -17,8 +17,9 @@ NVIDIA ShadowPlay等の「インスタントリプレイ」機能で保存済み
   1920x1080の録画を前提に調整したものです。異なる解像度・アスペクト比・HUDスケール
   設定では `src/kill_detector.py` の `ROIConfig` を調整する必要があります。
 - 自分のキル判定は、自分のプレイヤー名をキルフィード内でテンプレートマッチングする
-  方式です。**利用する際は `assets/templates/own_name.png` を自分のプレイヤー名を
-  切り出した画像に差し替えてください**（差し替えないと他人の名前を自分として誤判定します）。
+  方式です。**利用する際は `assets/templates/own_name.png` に、自分のプレイヤー名を
+  キルフィードから切り出した画像を自分で用意して配置してください**（個人が特定できる
+  情報のためリポジトリには含めておらず、`.gitignore`対象です。配置しないと動作しません）。
 
 ## 必要環境
 
@@ -40,8 +41,8 @@ pip install -r requirements.txt
 
 ## 使い方
 
-1. `assets/templates/own_name.png` を、自分のプレイヤー名をキルフィードから
-   切り出した画像に差し替える。
+1. 自分のプレイヤー名をキルフィードから切り出した画像を用意し、
+   `assets/templates/own_name.png` として配置する。
 2. 処理したい録画クリップ（`.mp4`）を `clipsample/` ディレクトリに置く。
 3. 実行する。
 
@@ -57,7 +58,7 @@ pip install -r requirements.txt
 
 ```
 valorant-clipmaker/
-├── assets/templates/    # キル検出用のテンプレート画像
+├── assets/templates/    # キル検出用のテンプレート画像（own_name.pngは各自配置、gitignore対象）
 ├── clipsample/          # 入力動画を置く場所（gitignore対象）
 ├── output/              # 出力先（gitignore対象）
 ├── plans/               # 設計ドキュメント
